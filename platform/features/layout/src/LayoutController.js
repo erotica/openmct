@@ -33,6 +33,13 @@ define(
             DEFAULT_GRID_SIZE = [32, 32],
             MINIMUM_FRAME_SIZE = [320, 180];
 
+        var DEFAULT_HIDDEN_FRAME_TYPES = [
+            'hyperlink'
+        ];
+
+        // Method names to expose from this controller
+        var HIDE = 'hideFrame', SHOW = 'showFrame';
+
         /**
          * The LayoutController is responsible for supporting the
          * Layout view. It arranges frames according to saved configuration
@@ -79,6 +86,11 @@ define(
                     ],
                     dimensions: self.defaultDimensions()
                 };
+
+                // Store the id so that the newly-dropped object
+                // gets selected during refresh composition
+                self.droppedFrameId = id;
+
                 // Mark change as persistable
                 if ($scope.commit) {
                     $scope.commit("Dropped a frame.");
@@ -111,6 +123,13 @@ define(
 
                         $scope.composition = composition;
                         self.layoutPanels(ids);
+                        self.setDefaultFrame(ids);
+
+                        // If there is a newly-dropped object, select it.
+                        if (self.droppedFrameId) {
+                            self.select(null, self.droppedFrameId);
+                            delete self.droppedFrameId;
+                        }
                     }
                 });
             }
@@ -123,13 +142,21 @@ define(
                 // saved by the EditRepresenter.
                 $scope.configuration =
                     $scope.configuration || {};
+
                 // Make sure there is a "panels" field in the
                 // view configuration.
                 $scope.configuration.panels =
                     $scope.configuration.panels || {};
-                // Store the position of this panel.
+
                 $scope.configuration.panels[self.activeDragId] =
-                    self.rawPositions[self.activeDragId];
+                    $scope.configuration.panels[self.activeDragId] || {};
+
+                // Store the position and dimensions of this panel.
+                $scope.configuration.panels[self.activeDragId].position =
+                    self.rawPositions[self.activeDragId].position;
+                $scope.configuration.panels[self.activeDragId].dimensions =
+                    self.rawPositions[self.activeDragId].dimensions;
+
                 // Mark this object as dirty to encourage persistence
                 if ($scope.commit) {
                     $scope.commit("Moved frame.");
@@ -144,12 +171,46 @@ define(
             // Watch for changes to the grid size in the model
             $scope.$watch("model.layoutGrid", updateGridSize);
 
+            $scope.$watch("selection", function (selection) {
+                this.selection = selection;
+            }.bind(this));
+
             // Update composed objects on screen, and position panes
             $scope.$watchCollection("model.composition", refreshComposition);
 
             // Position panes where they are dropped
             $scope.$on("mctDrop", handleDrop);
         }
+
+        // Utility function to copy raw positions from configuration,
+        // without writing directly to configuration (to avoid triggering
+        // persistence from watchers during drags).
+        function shallowCopy(obj, keys) {
+            var copy = {};
+            keys.forEach(function (k) {
+                copy[k] = obj[k];
+            });
+            return copy;
+        }
+
+        // Set a default value for hasFrame property on a panel.
+        // A 'hyperlink' object should have no frame by default.
+        LayoutController.prototype.setDefaultFrame = function (ids) {
+            var panels = shallowCopy(this.$scope.configuration.panels || {}, ids);
+
+            this.frames = {};
+
+            this.$scope.composition.forEach(function (object) {
+                var id = object.getId();
+                panels[id] = panels[id] || {};
+
+                if (panels[id].hasOwnProperty('hasFrame')) {
+                    this.frames[id] = panels[id].hasFrame;
+                } else {
+                    this.frames[id] = DEFAULT_HIDDEN_FRAME_TYPES.indexOf(object.getModel().type) === -1;
+                }
+            }, this);
+        };
 
         // Convert from { positions: ..., dimensions: ... } to an
         // appropriate ng-style argument, to position frames.
@@ -237,6 +298,7 @@ define(
                 this.gridSize
             );
         };
+
         /**
          * Continue an active drag gesture.
          * @param {number[]} delta the offset, in pixels,
@@ -250,17 +312,6 @@ define(
                 this.populatePosition(this.activeDragId);
             }
         };
-
-        // Utility function to copy raw positions from configuration,
-        // without writing directly to configuration (to avoid triggering
-        // persistence from watchers during drags).
-        function shallowCopy(obj, keys) {
-            var copy = {};
-            keys.forEach(function (k) {
-                copy[k] = obj[k];
-            });
-            return copy;
-        }
 
         /**
          * Compute panel positions based on the layout's object model.
@@ -293,7 +344,100 @@ define(
          * view configuration.
          */
         LayoutController.prototype.endDrag = function () {
+            this.frameMoved = true;
+
+            setTimeout(function () {
+                this.frameMoved = false;
+            }.bind(this), 0);
+
             this.endDragInScope();
+        };
+
+        /**
+         * Check if the object is currently selected.
+         *
+         * @param {string} obj the object to check for selection
+         * @returns {boolean} true if selected, otherwise false
+         */
+        LayoutController.prototype.selected = function (obj) {
+            return !!this.selectedId && this.selectedId === obj.getId();
+        };
+
+        /**
+         * Set the active user selection in this view.
+         *
+         * @param event the mouse event
+         * @param {string} id the object id
+         */
+        LayoutController.prototype.select = function (event, id) {
+            if (event) {
+                event.stopPropagation();
+                if (this.selection) {
+                    event.preventDefault();
+                }
+            }
+
+            var self = this;
+            var selectedObj = {};
+            var configuration = this.$scope.configuration;
+
+            this.selectedId = id;
+
+            // Toggle the visibility of the object frame
+            function toggle() {
+                // create new selection object so toolbar updates.
+                selectedObj = {};
+                if (!configuration.panels[id]) {
+                    configuration.panels[id] = {};
+                }
+
+                self.frames[id] = configuration.panels[id].hasFrame = !self.frames[id];
+
+                // Change which method is exposed, to influence
+                // which button is shown in the toolbar
+                selectedObj[self.frames[id] ? HIDE : SHOW] = toggle;
+                self.selection.deselect();
+                self.selection.select(selectedObj);
+            }
+
+            // Expose initial toggle
+            selectedObj[self.frames[id] ? HIDE : SHOW] = toggle;
+
+            if (this.selection) {
+                this.selection.select(selectedObj);
+            }
+        };
+
+        /**
+         * Clear the current user selection.
+         */
+        LayoutController.prototype.clearSelection = function (event) {
+            // Keep the selection if the frame is moved.
+            if (this.frameMoved) {
+                this.frameMoved = false;
+                return;
+            }
+
+            if (this.selection) {
+                this.selection.deselect();
+                delete this.selectedId;
+            }
+        };
+
+        /**
+         * Check if the object has frame.
+         */
+        LayoutController.prototype.hasFrame = function (obj) {
+            return this.frames[obj.getId()];
+        };
+
+        /**
+         * Get the size of the grid, in pixels. The returned array
+         * is in the form `[x, y]`.
+         * @returns {number[]} the grid size
+         */
+        LayoutController.prototype.getGridSize = function () {
+            return this.gridSize;
         };
 
         return LayoutController;
